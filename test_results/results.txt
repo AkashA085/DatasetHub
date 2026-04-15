@@ -1,0 +1,8 @@
+============================================================
+YOLOv8 INFERENCE RESULTS
+============================================================
+Model: mlruns\1\1d197d2b4ccf4a159a95ed86fd38b5cc\artifacts\best_model.pt
+Image: D:\AKASHFWD\NewImg\fwd_drone_A_03.jpg
+Confidence Threshold: 0.1
+Detections: 0
+

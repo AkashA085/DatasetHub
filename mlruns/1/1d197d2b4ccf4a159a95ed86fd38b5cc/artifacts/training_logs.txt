@@ -1,0 +1,5 @@
+[06:47:15] Job queued.
+[06:47:15] Starting training job.
+[06:47:16] Prepared dataset splits: train=31, val=8, test=4
+[06:47:23] MLflow run started (experiment='dataset_training', run_id='1d197d2b4ccf4a159a95ed86fd38b5cc')
+[06:47:23] Running Ultralytics YOLO training.

@@ -162,3 +162,21 @@ class ClassDistribution(Base):
     object_count = Column(Integer)
 
     dataset = relationship("Dataset", back_populates="class_distributions")
+
+
+class TrainingJob(Base):
+    __tablename__ = "training_jobs"
+    id = Column(String(36), primary_key=True)  # job_id
+    dataset_id = Column(String(36), ForeignKey("datasets.id"), nullable=False)
+    status = Column(String(50), default="queued")  # queued, preparing, running, completed, failed
+    params = Column(JSON, nullable=True)  # training parameters
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    metrics = Column(JSON, nullable=True)  # training metrics
+    artifacts = Column(JSON, nullable=True)  # model weights paths, etc.
+    mlflow = Column(JSON, nullable=True)  # mlflow tracking info
+    error = Column(String(2048), nullable=True)  # error message if failed
+    logs = Column(JSON, nullable=True)  # list of log messages
+
+    dataset = relationship("Dataset")

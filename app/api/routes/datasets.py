@@ -14,8 +14,10 @@ import shutil
 from pathlib import Path
 import json
 from pydantic import BaseModel
-from app.utils.file_utils import cleanup_session, STORAGE_ROOT
+from app.utils.file_utils import cleanup_session, STORAGE_ROOT, PROCESSED_DIR
 from datetime import datetime
+from PIL import Image as PILImage
+import numpy as np
 
 router = APIRouter()
 
@@ -63,6 +65,23 @@ class PaginatedImagesResponse(BaseModel):
     limit: int
     total_pages: int
 
+class GlobalImageInfo(BaseModel):
+    id: str
+    dataset_id: str
+    file_name: str
+    url: str
+    has_label: bool
+
+    class Config:
+        from_attributes = True
+
+class PaginatedGlobalImagesResponse(BaseModel):
+    images: List[GlobalImageInfo]
+    total: int
+    page: int
+    limit: int
+    total_pages: int
+
 class LabelUpdateResponse(BaseModel):
     status: str
     message: str
@@ -104,6 +123,120 @@ class StatisticsResponse(BaseModel):
     corrupted_image_count: int
     class_distribution: List[ClassDistributionItem]
     validation_metrics: Optional[dict]
+
+class ImageIssueInfo(BaseModel):
+    id: str
+    file_name: str
+    url: str
+    issues: List[str]
+    blur_score: Optional[float]
+    invalid_label_count: int
+
+class ImageIssuesResponse(BaseModel):
+    flagged_images: List[ImageIssueInfo]
+    total_flagged: int
+
+
+def _to_storage_url(file_path: str) -> str:
+    """Convert an absolute file path to mounted `/storage/...` URL."""
+    if not file_path or "storage" not in file_path:
+        return ""
+    parts = file_path.split("storage")
+    if len(parts) <= 1:
+        return ""
+    return "/storage" + parts[1].replace("\\", "/")
+
+
+def _parse_yolo_bbox(raw_bbox) -> Optional[List[float]]:
+    if not isinstance(raw_bbox, dict):
+        return None
+    yolo = raw_bbox.get("yolo", [])
+    if not isinstance(yolo, list) or len(yolo) < 4:
+        return None
+    try:
+        return [float(yolo[0]), float(yolo[1]), float(yolo[2]), float(yolo[3])]
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_invalid_bbox(yolo_bbox: List[float]) -> bool:
+    cx, cy, w, h = yolo_bbox
+    if w <= 0 or h <= 0:
+        return True
+    if not (0 <= cx <= 1 and 0 <= cy <= 1 and 0 <= w <= 1 and 0 <= h <= 1):
+        return True
+
+    x_min = cx - (w / 2)
+    x_max = cx + (w / 2)
+    y_min = cy - (h / 2)
+    y_max = cy + (h / 2)
+    return x_min < 0 or y_min < 0 or x_max > 1 or y_max > 1
+
+
+def _compute_blur_score(file_path: str) -> Optional[float]:
+    """
+    Lightweight blur score based on gradient variance.
+    Lower scores indicate blurrier images.
+    """
+    try:
+        with PILImage.open(file_path) as img:
+            gray = np.asarray(img.convert("L"), dtype=np.float32)
+            if gray.size == 0:
+                return None
+            gx = np.diff(gray, axis=1)
+            gy = np.diff(gray, axis=0)
+            return float(np.var(gx) + np.var(gy))
+    except Exception:
+        return None
+
+
+def _load_annotations_yolo_map(dataset_id: str) -> dict:
+    """
+    Load validator output saved at upload time and expose labels as YOLO normalized coords.
+    Keyed by image stem lowercase.
+    """
+    result = {}
+    ann_path = PROCESSED_DIR / dataset_id / "annotations.json"
+    if not ann_path.exists():
+        return result
+
+    try:
+        with open(ann_path, "r", encoding="utf-8") as f:
+            annotations = json.load(f)
+
+        for ann in annotations:
+            stem = str(ann.get("image_name", "")).strip().lower()
+            width = float(ann.get("width", 0) or 0)
+            height = float(ann.get("height", 0) or 0)
+            if not stem or width <= 0 or height <= 0:
+                continue
+
+            labels = []
+            for obj in ann.get("objects", []):
+                try:
+                    xmin = float(obj.get("xmin"))
+                    ymin = float(obj.get("ymin"))
+                    xmax = float(obj.get("xmax"))
+                    ymax = float(obj.get("ymax"))
+                    class_id = str(obj.get("class_id"))
+                except Exception:
+                    continue
+
+                cx = ((xmin + xmax) / 2.0) / width
+                cy = ((ymin + ymax) / 2.0) / height
+                bw = max(0.0, (xmax - xmin) / width)
+                bh = max(0.0, (ymax - ymin) / height)
+
+                labels.append(LabelInfo(
+                    class_id=class_id,
+                    bbox=BboxData(yolo=[cx, cy, bw, bh])
+                ))
+
+            result[stem] = labels
+    except Exception:
+        return {}
+
+    return result
 
 
 @router.get("/datasets", response_model=PaginatedDatasetsResponse)
@@ -209,7 +342,7 @@ async def list_dataset_images(
     page: int = Query(1, ge=1),
     limit: int = Query(12, ge=1, le=100),
     has_label: Optional[bool] = None,
-    force_file_labels: bool = Query(False),
+    force_file_labels: bool = Query(True),
     db: Session = Depends(get_db)
 ):
     """
@@ -236,6 +369,8 @@ async def list_dataset_images(
     # Calculate total pages
     total_pages = (total + limit - 1) // limit
     
+    annotations_map = _load_annotations_yolo_map(dataset_id)
+
     # Process images to include URLs and labels
     processed_images = []
     for img in images:
@@ -247,29 +382,19 @@ async def list_dataset_images(
                 rel_path = "/storage" + parts[1].replace("\\", "/")
         
         labels_info = []
-        # Try database labels first unless forcing file
-        if not force_file_labels and img.labels:
-            for lbl in img.labels:
-                labels_info.append(LabelInfo(
-                    class_id=lbl.class_id,
-                    bbox=BboxData(yolo=lbl.bbox_data.get("yolo", []))
-                ))
-        
-        # If no DB labels or forced, try file fallback
+        image_stem = Path(img.file_name).stem.lower() if img.file_name else ""
+
+        # 0) Prefer current label files from disk (source of truth after edits/augmentation).
         if not labels_info:
             try:
-                # Robust path resolution
                 img_path = Path(img.file_path)
-                # Find parent directory containing both images and labels
-                # Structure: .../images/file.jpg and .../labels/file.txt
-                # We handle nested storage structures by looking for the 'images' folder specifically
                 img_path_parts = list(img_path.parts)
                 if "images" in img_path_parts:
                     idx = img_path_parts.index("images")
                     label_parts = list(img_path_parts)
                     label_parts[idx] = "labels"
                     label_file_path = Path(*label_parts).with_suffix(".txt")
-                    
+
                     if label_file_path.exists():
                         with open(label_file_path, "r", encoding="utf-8") as f:
                             for line in f:
@@ -283,7 +408,19 @@ async def list_dataset_images(
                                     except ValueError:
                                         continue
             except Exception as e:
-                print(f"Error reading fallback label file: {e}")
+                print(f"Error reading label file: {e}")
+
+        # 1) Fallback to upload-time validator annotations.
+        if not labels_info and image_stem and image_stem in annotations_map:
+            labels_info = annotations_map.get(image_stem, [])
+
+        # 2) Optional fallback: DB labels if file labels were not found and caller asks.
+        if not labels_info and not force_file_labels and img.labels:
+            for lbl in img.labels:
+                labels_info.append(LabelInfo(
+                    class_id=lbl.class_id,
+                    bbox=BboxData(yolo=lbl.bbox_data.get("yolo", []))
+                ))
             
         processed_images.append(ImageInfo(
             id=img.id,
@@ -299,6 +436,71 @@ async def list_dataset_images(
         page=page,
         limit=limit,
         total_pages=total_pages
+    )
+
+
+@router.get("/datasets/{dataset_id}/images/issues", response_model=ImageIssuesResponse)
+async def list_dataset_image_issues(
+    dataset_id: str,
+    page: int = Query(1, ge=1),
+    limit: int = Query(12, ge=1, le=200),
+    blur_threshold: float = Query(20.0, gt=0),
+    db: Session = Depends(get_db)
+):
+    """
+    Flag images needing review:
+    - missing_label: no labels present
+    - invalid_bbox: bbox outside valid YOLO normalized range / frame
+    - blurry_image: low gradient variance score
+    - object_too_small: bbox area very small (likely hard-to-see target)
+    """
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    query = db.query(Image).filter(Image.dataset_id == dataset_id).options(joinedload(Image.labels))
+    offset = (page - 1) * limit
+    images = query.offset(offset).limit(limit).all()
+
+    flagged_images: List[ImageIssueInfo] = []
+    for img in images:
+        issues: List[str] = []
+        invalid_label_count = 0
+
+        parsed_boxes: List[List[float]] = []
+        for lbl in img.labels:
+            yolo_bbox = _parse_yolo_bbox(lbl.bbox_data)
+            if not yolo_bbox or _is_invalid_bbox(yolo_bbox):
+                invalid_label_count += 1
+                continue
+            parsed_boxes.append(yolo_bbox)
+
+        if len(img.labels) == 0:
+            issues.append("missing_label")
+        if invalid_label_count > 0:
+            issues.append("invalid_bbox")
+        if any((w * h) < 0.002 for _, _, w, h in parsed_boxes):
+            issues.append("object_too_small")
+
+        blur_score = _compute_blur_score(img.file_path)
+        if blur_score is not None and blur_score < blur_threshold:
+            issues.append("blurry_image")
+
+        if issues:
+            flagged_images.append(
+                ImageIssueInfo(
+                    id=img.id,
+                    file_name=img.file_name,
+                    url=_to_storage_url(img.file_path),
+                    issues=issues,
+                    blur_score=blur_score,
+                    invalid_label_count=invalid_label_count,
+                )
+            )
+
+    return ImageIssuesResponse(
+        flagged_images=flagged_images,
+        total_flagged=len(flagged_images),
     )
 
 
@@ -341,6 +543,50 @@ async def get_dataset_statistics(
         corrupted_image_count=dataset.corrupted_image_count,
         class_distribution=[ClassDistributionItem.from_orm(cd) for cd in class_dist],
         validation_metrics=validation_metrics
+    )
+
+
+@router.get("/images", response_model=PaginatedGlobalImagesResponse)
+async def list_all_images(
+    page: int = Query(1, ge=1),
+    limit: int = Query(48, ge=1, le=200),
+    has_label: Optional[bool] = None,
+    dataset_id: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    List all images across datasets (global gallery) with pagination.
+    """
+    query = db.query(Image)
+
+    if dataset_id:
+        query = query.filter(Image.dataset_id == dataset_id)
+
+    if has_label is not None:
+        query = query.filter(Image.has_label == has_label)
+
+    total = query.count()
+    offset = (page - 1) * limit
+    images = query.order_by(Image.file_name.asc()).offset(offset).limit(limit).all()
+    total_pages = (total + limit - 1) // limit
+
+    mapped = [
+        GlobalImageInfo(
+            id=img.id,
+            dataset_id=img.dataset_id,
+            file_name=img.file_name,
+            url=_to_storage_url(img.file_path),
+            has_label=img.has_label,
+        )
+        for img in images
+    ]
+
+    return PaginatedGlobalImagesResponse(
+        images=mapped,
+        total=total,
+        page=page,
+        limit=limit,
+        total_pages=total_pages
     )
 
 @router.put("/datasets/{dataset_id}/images/{image_id}/labels", response_model=LabelUpdateResponse)

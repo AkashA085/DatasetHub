@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from PIL import Image
 from typing import Dict, List, Set, Tuple
@@ -9,6 +10,30 @@ class DatasetValidator:
         self.images_dir = images_dir
         self.labels_dir = labels_dir
         self.image_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+        self._hash_suffix_pattern = re.compile(r"_[0-9a-f]{12}$")
+
+    def _normalize_stem(self, p: Path) -> str:
+        """Normalize stem for matching image/label pairs after long-path fallback renames."""
+        stem = p.stem.lower()
+        return self._hash_suffix_pattern.sub("", stem)
+
+    def _alt_match_key(self, stem: str) -> str:
+        """Build a fallback key using trailing id pattern, e.g. A_01 -> a_1."""
+        tokens = [t for t in re.split(r"[^a-zA-Z0-9]+", stem.lower()) if t]
+        if not tokens:
+            return stem
+        num_idx = None
+        for i in range(len(tokens) - 1, -1, -1):
+            if tokens[i].isdigit():
+                num_idx = i
+                break
+        if num_idx is None:
+            return tokens[-1]
+        num = str(int(tokens[num_idx]))
+        prefix = ""
+        if num_idx - 1 >= 0 and tokens[num_idx - 1].isalpha() and len(tokens[num_idx - 1]) <= 3:
+            prefix = tokens[num_idx - 1]
+        return f"{prefix}_{num}" if prefix else num
 
     def validate(self) -> Tuple[ValidationReport, List[ImageAnnotation], Dict[str, Path], Dict[str, Path], List[str]]:
         """Validate the dataset and return a report, internal annotations, path mappings, and class names."""
@@ -36,16 +61,50 @@ class DatasetValidator:
 
         # 2. Map stem (lower) to file path
         # EVERY .txt file is a label candidate
-        image_map = {p.stem.lower(): p for p in all_image_paths.values()}
-        label_map = {p.stem.lower(): p for p in all_label_paths.values()}
+        image_map: Dict[str, Path] = {}
+        label_map: Dict[str, Path] = {}
+        for p in all_image_paths.values():
+            key = self._normalize_stem(p)
+            if key not in image_map:
+                image_map[key] = p
+        for p in all_label_paths.values():
+            key = self._normalize_stem(p)
+            if key not in label_map:
+                label_map[key] = p
 
         image_stems = set(image_map.keys())
         label_stems = set(label_map.keys())
 
         # 3. Set Logic
         matched_stems = image_stems & label_stems
-        missing_label_stems = image_stems - label_stems
-        orphan_label_stems = label_stems - image_stems
+        matched_pairs: Dict[str, str] = {s: s for s in matched_stems}
+        missing_label_stems = set(image_stems - label_stems)
+        orphan_label_stems = set(label_stems - image_stems)
+
+        # Fallback pairing for datasets whose image/label stems differ by prefixes
+        # (example: fwd_drone_A_01.jpg vs fwd_labels_A_01.txt).
+        if not matched_stems and missing_label_stems and orphan_label_stems:
+            alt_image_map: Dict[str, str] = {}
+            alt_label_map: Dict[str, str] = {}
+            for s in missing_label_stems:
+                k = self._alt_match_key(s)
+                if k not in alt_image_map:
+                    alt_image_map[k] = s
+            for s in orphan_label_stems:
+                k = self._alt_match_key(s)
+                if k not in alt_label_map:
+                    alt_label_map[k] = s
+
+            alt_keys = set(alt_image_map.keys()) & set(alt_label_map.keys())
+            for k in alt_keys:
+                img_stem = alt_image_map[k]
+                lbl_stem = alt_label_map[k]
+                matched_stems.add(img_stem)
+                matched_pairs[img_stem] = lbl_stem
+                if img_stem in missing_label_stems:
+                    missing_label_stems.remove(img_stem)
+                if lbl_stem in orphan_label_stems:
+                    orphan_label_stems.remove(lbl_stem)
 
         corrupted_images = 0
         internal_annotations = []
@@ -63,7 +122,7 @@ class DatasetValidator:
         # 4. Process Matched Pairs
         for stem in matched_stems:
             img_path = image_map[stem]
-            label_path = label_map[stem]
+            label_path = label_map[matched_pairs.get(stem, stem)]
 
             # Check image corruption & get size
             try:
