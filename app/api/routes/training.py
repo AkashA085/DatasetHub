@@ -282,6 +282,7 @@ def _log_params_chunked(mlflow_module: Any, params: Dict[str, Any], chunk_size: 
 
 
 def _resolve_device(device_value: Any) -> str:
+    """Resolve device with CUDA validation and optimization."""
     raw = str(device_value or "").strip().lower()
     if raw in {"", "none"}:
         return "cpu"
@@ -289,12 +290,92 @@ def _resolve_device(device_value: Any) -> str:
         return str(device_value)
     try:
         import torch  # type: ignore
-        return "0" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            # Validate CUDA is properly configured
+            try:
+                torch.cuda.init()
+                torch.cuda.empty_cache()
+                device_count = torch.cuda.device_count()
+                device_name = torch.cuda.get_device_name(0)
+                device_props = torch.cuda.get_device_properties(0)
+                total_memory = device_props.total_memory / (1024**3)  # Convert to GB
+                return "0"
+            except Exception as cuda_error:
+                print(f"⚠️  CUDA error: {cuda_error}. Falling back to CPU.")
+                return "cpu"
+        return "cpu"
     except Exception:
         return "cpu"
 
 
-def _prepare_yolo_dataset(dataset_id: str, seed: int, val_split: float, test_split: float, db: Session, job: Dict[str, Any]) -> Dict[str, Any]:
+def _validate_and_setup_gpu(device: str, job: Dict[str, Any]) -> None:
+    """Validate GPU setup and log device information."""
+    if device.lower() == "cpu":
+        _append_log(job, "⚠️  Training will run on CPU - this will be VERY SLOW")
+        return
+    
+    try:
+        import torch  # type: ignore
+        _append_log(job, f"✓ CUDA Available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            _append_log(job, f"✓ GPU Device Count: {device_count}")
+            for i in range(device_count):
+                props = torch.cuda.get_device_properties(i)
+                total_mem = props.total_memory / (1024**3)
+                _append_log(job, f"  GPU {i}: {props.name} ({total_mem:.1f}GB)")
+            torch.cuda.empty_cache()
+            _append_log(job, "✓ GPU memory cleared and ready")
+    except Exception as e:
+        _append_log(job, f"⚠️  GPU validation warning: {str(e)}")
+
+
+def _get_optimal_batch_size(device: str, image_size: int = 640) -> int:
+    """Recommend optimal batch size based on GPU memory."""
+    if device.lower() == "cpu":
+        return 8  # Conservative for CPU
+    
+    try:
+        import torch  # type: ignore
+        if not torch.cuda.is_available():
+            return 16
+        
+        total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+        
+        # Batch size recommendations based on VRAM and image size
+        if image_size >= 1280:
+            if total_memory >= 24:
+                return 64
+            elif total_memory >= 16:
+                return 32
+            elif total_memory >= 8:
+                return 16
+            else:
+                return 8
+        elif image_size >= 640:
+            if total_memory >= 24:
+                return 128
+            elif total_memory >= 16:
+                return 64
+            elif total_memory >= 8:
+                return 32
+            else:
+                return 16
+        else:  # <= 416
+            if total_memory >= 24:
+                return 256
+            elif total_memory >= 16:
+                return 128
+            elif total_memory >= 8:
+                return 64
+            else:
+                return 32
+    except Exception:
+        return 16  # Default fallback
+
+
+
+
     """Prepare YOLO dataset from uploaded real data only.
     
     CRITICAL: This function MUST use only images with labels from uploaded datasets.
@@ -570,6 +651,9 @@ def _run_training(job_id: str) -> None:
         if str(requested_device).strip().lower() == "auto":
             _append_log(job, f"Resolved device='auto' to '{resolved_device}'.")
 
+        # Validate and setup GPU
+        _validate_and_setup_gpu(resolved_device, job)
+
         tracking_params: Dict[str, Any] = {
             "dataset_name": dataset_name,
             "dataset_version": dataset_version,
@@ -621,6 +705,16 @@ def _run_training(job_id: str) -> None:
 
         model = YOLO(job["params"]["model"])
 
+        # Clear GPU memory before training
+        if resolved_device != "cpu":
+            try:
+                import torch  # type: ignore
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+                _append_log(job, "✓ GPU memory cleared and optimized")
+            except Exception as e:
+                _append_log(job, f"⚠️  GPU memory clear warning: {str(e)}")
+
         # capture stdout/stderr from Ultralytics training so we can surface it
         # in the job log and make it visible to the frontend.  Ultralytics
         # prints progress directly to stdout, so we temporarily replace
@@ -668,6 +762,29 @@ def _run_training(job_id: str) -> None:
                 name="train",
                 exist_ok=True,
                 seed=job["params"]["seed"],
+                # GPU Optimization Parameters
+                workers=8 if resolved_device != "cpu" else 2,  # Increase workers for GPU training
+                cache=True if resolved_device != "cpu" else False,  # Cache images in RAM for faster loading on GPU
+                amp=True,  # Automatic Mixed Precision - faster GPU training
+                patience=20,  # Early stopping patience (epochs without improvement)
+                # Data Augmentation - enhanced for better model robustness
+                hsv_h=0.015,  # Image HSV-Hue augmentation
+                hsv_s=0.7,    # Image HSV-Saturation augmentation
+                hsv_v=0.4,    # Image HSV-Value augmentation
+                degrees=10.0,  # Image rotation (+/- deg)
+                translate=0.1, # Image translation (+/- fraction)
+                scale=0.5,     # Image scale (+/- gain)
+                flipud=0.0,    # Image flip up-down (probability)
+                fliplr=0.5,    # Image flip left-right (probability)
+                mosaic=1.0,    # Image mosaic (probability)
+                mixup=0.0,     # Image mixup (probability)
+                # Performance optimizations
+                close_mosaic=10,  # Disables mosaic augmentation for final 10 epochs
+                # Validation
+                val=True,
+                save_period=1,
+                # Memory optimization
+                max_det=300,  # Maximum detections per image
             )
         finally:
             # restore original streams in all cases
